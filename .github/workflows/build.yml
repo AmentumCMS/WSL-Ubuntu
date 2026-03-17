@@ -100,6 +100,10 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # ── 1a. Ensure IMAGE_NAME is lowercase (registry names must be lowercase)
+      - name: Lowercase IMAGE_NAME
+        run: echo "IMAGE_NAME=$(echo '${{ env.IMAGE_NAME }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
+
       # ── 2. Version metadata ───────────────────────────────────────────────
       - name: Compute version and artifact names
         id: meta
@@ -508,6 +512,10 @@ jobs:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Ensure IMAGE_NAME is lowercase (registry names must be lowercase)
+      - name: Lowercase IMAGE_NAME
+        run: echo "IMAGE_NAME=$(echo '${{ env.IMAGE_NAME }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
 
       - name: Pull staged Docker image
         run: |
