@@ -2,6 +2,24 @@ name: Build WSL Ubuntu Image
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Builds a hardened, STIG-compliant Ubuntu WSL2 rootfs tarball and Docker image.
+#
+# Pipeline stages (main branch / tag push):
+#   build   → version   → release
+#                       → publish
+#
+# build  : Build rootfs, STIG-harden, scan (ClamAV / Trivy / Grype), upload
+#          workflow artifacts, and stage the Docker image to GHCR with a
+#          temporary sha-<short_sha> tag.
+# version: Auto-increment the semantic version (v1.0.X) and push a new git
+#          tag.  On tag-push events the existing tag is used as-is.
+# release: Download workflow artifacts and create a GitHub Release with
+#          auto-generated release notes and all build artifacts attached.
+# publish: Pull the staged Docker image, re-tag with the semantic version and
+#          :latest, push to GHCR (GitHub Packages), and attach a build-
+#          provenance attestation.
+#
+# On pull-requests only the build stage runs (no push, no release, no tag).
+#
 # Artifacts produced each run:
 #   • wsl-ubuntu-<version>-<build>.tar.gz  — WSL-importable rootfs
 #   • SHA256SUMS / SHA512SUMS              — integrity checksums
@@ -64,15 +82,18 @@ env:
   GRYPE_VERSION: "0.87.0"
 
 jobs:
+  # ══ Stage 1: Build · Harden · Scan ══════════════════════════════════════════
   build:
-    name: Build · Harden · Scan · Publish
+    name: Build · Harden · Scan
     runs-on: ubuntu-latest
+    outputs:
+      artifact_base: ${{ steps.meta.outputs.artifact_base }}
+      version:       ${{ steps.meta.outputs.version }}
+      image_ref:     ${{ steps.stage.outputs.image_ref }}
     permissions:
-      contents: write       # Create releases and upload assets
-      packages: write       # Push to GHCR
+      contents: read
+      packages: write        # Stage Docker image to GHCR
       security-events: write # Upload SARIF to GitHub Security tab
-      id-token: write        # OIDC for attestations
-      attestations: write    # Publish build provenance
 
     steps:
       # ── 1. Source ─────────────────────────────────────────────────────────
@@ -97,8 +118,6 @@ jobs:
           {
             echo "version=${VERSION}"
             echo "artifact_base=${ARTIFACT_BASE}"
-            echo "image_tag=${REGISTRY}/${IMAGE_NAME}:${VERSION}"
-            echo "image_latest=${REGISTRY}/${IMAGE_NAME}:latest"
           } >> "$GITHUB_OUTPUT"
 
       # ── 3. Container registry login ───────────────────────────────────────
@@ -276,39 +295,23 @@ jobs:
           echo "--- SHA256SUMS ---"
           cat SHA256SUMS
 
-      # ── 13. Publish Docker image to GHCR ─────────────────────────────────
-      - name: Push Docker image to GHCR
-        id: push
+      # ── 13. Stage Docker image to GHCR ────────────────────────────────────
+      # Push with a temporary sha-<short_sha> tag so the publish job (which
+      # runs on a fresh runner) can pull it and re-tag with the semantic version.
+      - name: Stage Docker image to GHCR
+        id: stage
         if: github.event_name != 'pull_request'
         run: |
-          IMAGE_TAG="${{ steps.meta.outputs.image_tag }}"
-          IMAGE_LATEST="${{ steps.meta.outputs.image_latest }}"
+          SHORT_SHA="${GITHUB_SHA::8}"
+          STAGE_TAG="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${SHORT_SHA}"
 
-          docker tag wsl-ubuntu:local "${IMAGE_TAG}"
-          docker push "${IMAGE_TAG}"
-          echo "Pushed ${IMAGE_TAG}"
+          docker tag wsl-ubuntu:local "${STAGE_TAG}"
+          docker push "${STAGE_TAG}"
 
-          if [[ "${GITHUB_REF}" == refs/heads/main ]] || [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-            docker tag wsl-ubuntu:local "${IMAGE_LATEST}"
-            docker push "${IMAGE_LATEST}"
-            echo "Pushed ${IMAGE_LATEST}"
-          fi
+          echo "image_ref=${STAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "Staged: ${STAGE_TAG}"
 
-          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "${IMAGE_TAG}" \
-            2>/dev/null | cut -d@ -f2 || echo "")
-          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
-          echo "Image digest: ${DIGEST}"
-
-      # ── 14. Build provenance attestation ─────────────────────────────────
-      - name: Generate build attestation
-        if: github.event_name != 'pull_request' && steps.push.outputs.digest != ''
-        uses: actions/attest-build-provenance@v2
-        with:
-          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          subject-digest: ${{ steps.push.outputs.digest }}
-          push-to-registry: true
-
-      # ── 15. Upload workflow artifacts ─────────────────────────────────────
+      # ── 14. Upload workflow artifacts ─────────────────────────────────────
       - name: Fix artifact directory permissions
         # Belt-and-suspenders: any sudo-created files (clamscan log, docker cp,
         # etc.) are re-owned to the runner user so upload-artifact can read them.
@@ -323,43 +326,132 @@ jobs:
           retention-days: 90
           compression-level: 0 # Already compressed
 
-      # ── 16. GitHub Release ────────────────────────────────────────────────
+  # ══ Stage 2: Auto-version ════════════════════════════════════════════════════
+  # Runs on main branch pushes (including scheduled) and on tag pushes.
+  # • Main branch: reads the latest v*.*.* git tag, bumps the patch version,
+  #   creates and pushes the new tag (e.g. v1.0.3).
+  # • Tag push  : the existing tag is used as-is — no new tag is created.
+  version:
+    name: Auto-version
+    needs: [build]
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name != 'pull_request' &&
+      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
+    permissions:
+      contents: write  # Push new git tag
+    outputs:
+      tag:    ${{ steps.compute.outputs.tag }}
+      semver: ${{ steps.compute.outputs.semver }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Full history required to inspect all tags
+
+      - name: Compute next semantic version
+        id: compute
+        run: |
+          set -euo pipefail
+
+          # ── Tag push: use the existing tag as-is ──────────────────────────
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF_NAME}"
+            SEMVER="${TAG#v}"
+            echo "Using existing tag: ${TAG}"
+            {
+              echo "tag=${TAG}"
+              echo "semver=${SEMVER}"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # ── Main branch: auto-increment patch version ─────────────────────
+          LATEST="$(git tag --list 'v*.*.*' --sort=-version:refname | head -1)"
+
+          if [[ -z "${LATEST}" ]]; then
+            # No previous release — start at v1.0.0
+            NEW_TAG="v1.0.0"
+            SEMVER="1.0.0"
+            echo "No existing version tags found; starting at ${NEW_TAG}"
+          else
+            echo "Latest tag: ${LATEST}"
+            MAJOR="$(echo "${LATEST#v}" | cut -d. -f1)"
+            MINOR="$(echo "${LATEST#v}" | cut -d. -f2)"
+            PATCH="$(echo "${LATEST#v}" | cut -d. -f3)"
+            PATCH=$(( PATCH + 1 ))
+            NEW_TAG="v${MAJOR}.${MINOR}.${PATCH}"
+            SEMVER="${MAJOR}.${MINOR}.${PATCH}"
+          fi
+
+          echo "New version tag: ${NEW_TAG}"
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git tag -a "${NEW_TAG}" \
+            -m "Automated release ${NEW_TAG} — Ubuntu ${UBUNTU_VERSION} build ${{ needs.build.outputs.version }}"
+          git push origin "${NEW_TAG}"
+
+          {
+            echo "tag=${NEW_TAG}"
+            echo "semver=${SEMVER}"
+          } >> "$GITHUB_OUTPUT"
+
+  # ══ Stage 3: GitHub Release ═══════════════════════════════════════════════════
+  # Downloads the workflow artifacts produced by the build stage and creates
+  # a GitHub Release tagged with the semantic version from the version stage.
+  release:
+    name: Release
+    needs: [build, version]
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name != 'pull_request' &&
+      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
+    permissions:
+      contents: write  # Create release and upload assets
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.artifact_base }}
+          path: artifacts/
+
       - name: Create GitHub Release
-        if: >
-          github.event_name != 'pull_request' &&
-          (startsWith(github.ref, 'refs/tags/') || github.ref == 'refs/heads/main')
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: >-
-            ${{ startsWith(github.ref, 'refs/tags/')
-              && github.ref_name
-              || format('build-{0}', steps.meta.outputs.version) }}
+          tag_name: ${{ needs.version.outputs.tag }}
+          # Ternary: tag push → "Release v1.2.3", main push → "WSL Ubuntu v1.2.3 — Build <date-sha>"
           name: >-
             ${{ startsWith(github.ref, 'refs/tags/')
-              && format('Release {0}', github.ref_name)
-              || format('Automated Build {0}', steps.meta.outputs.version) }}
+              && format('Release {0}', needs.version.outputs.tag)
+              || format('WSL Ubuntu {0} — Build {1}', needs.version.outputs.tag, needs.build.outputs.version) }}
           prerelease: ${{ !startsWith(github.ref, 'refs/tags/') }}
           generate_release_notes: true
           fail_on_unmatched_files: false
           body: |
-            ## WSL Ubuntu ${{ env.UBUNTU_VERSION }} — Build `${{ steps.meta.outputs.version }}`
+            ## WSL Ubuntu ${{ env.UBUNTU_VERSION }} — ${{ needs.version.outputs.tag }}
+
+            > Build ref: `${{ needs.build.outputs.version }}`
 
             ### Import into WSL2 (PowerShell)
 
             ```powershell
             # Download tarball and checksums from the assets list above, then:
             # Verify (replace <sha256> with value from SHA256SUMS)
-            (Get-FileHash "${{ steps.meta.outputs.artifact_base }}.tar.gz" -Algorithm SHA256).Hash
+            (Get-FileHash "${{ needs.build.outputs.artifact_base }}.tar.gz" -Algorithm SHA256).Hash
 
             # Import
-            wsl --import Ubuntu-Hardened C:\WSL\Ubuntu-Hardened "${{ steps.meta.outputs.artifact_base }}.tar.gz" --version 2
+            wsl --import Ubuntu-Hardened C:\WSL\Ubuntu-Hardened "${{ needs.build.outputs.artifact_base }}.tar.gz" --version 2
             wsl -d Ubuntu-Hardened
             ```
 
             ### Pull from GHCR (Docker / Linux)
 
             ```bash
-            docker pull ${{ steps.meta.outputs.image_tag }}
+            docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.version.outputs.tag }}
             ```
 
             ### Artifacts Included
@@ -392,3 +484,69 @@ jobs:
             artifacts/scan-results/grype-results.txt
             artifacts/scan-results/*.spdx.json
             artifacts/scan-results/*.cyclonedx.json
+
+  # ══ Stage 4: Publish to GitHub Packages (GHCR) ════════════════════════════════
+  # Pulls the staged Docker image (sha-<short_sha> tag) uploaded by the build
+  # stage, re-tags it with the semantic version and :latest, pushes both to
+  # GHCR (GitHub Packages), and attaches a build-provenance attestation.
+  publish:
+    name: Publish · GitHub Packages
+    needs: [build, version]
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name != 'pull_request' &&
+      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
+    permissions:
+      packages: write    # Push to GHCR
+      id-token: write    # OIDC for build-provenance attestation
+      attestations: write
+
+    steps:
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull staged Docker image
+        run: |
+          docker pull "${{ needs.build.outputs.image_ref }}"
+          docker tag  "${{ needs.build.outputs.image_ref }}" wsl-ubuntu:local
+          echo "Pulled staged image: ${{ needs.build.outputs.image_ref }}"
+
+      - name: Tag and push versioned image to GHCR
+        id: push
+        env:
+          NEW_TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          VERSIONED="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${NEW_TAG}"
+          LATEST="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+
+          docker tag wsl-ubuntu:local "${VERSIONED}"
+          docker push "${VERSIONED}"
+          echo "Pushed ${VERSIONED}"
+
+          docker tag wsl-ubuntu:local "${LATEST}"
+          docker push "${LATEST}"
+          echo "Pushed ${LATEST}"
+
+          # RepoDigests are populated after the push; pull the manifest to
+          # ensure the digest is available before inspecting.
+          docker pull --quiet "${VERSIONED}"
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "${VERSIONED}" \
+            2>/dev/null | cut -d@ -f2 || true)
+          if [[ -z "${DIGEST}" ]]; then
+            echo "::warning::Could not determine image digest; skipping attestation"
+          else
+            echo "Image digest: ${DIGEST}"
+          fi
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+
+      - name: Generate build provenance attestation
+        if: steps.push.outputs.digest != ''
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
