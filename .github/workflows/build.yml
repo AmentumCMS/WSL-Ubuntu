@@ -181,6 +181,10 @@ jobs:
             --log="artifacts/scan-results/clamav-results.txt" \
             /tmp/rootfs-scan || CLAM_EXIT=$?
 
+          # clamscan writes the log as root; restore runner ownership so
+          # actions/upload-artifact can read the file.
+          sudo chown "$(id -u):$(id -g)" artifacts/scan-results/clamav-results.txt
+
           echo "ClamAV exit code: ${CLAM_EXIT}"
           # Exit 1 = virus found; Exit 2 = scan error (treat as warning)
           if [ "${CLAM_EXIT}" -eq 1 ]; then
@@ -305,6 +309,12 @@ jobs:
           push-to-registry: true
 
       # ── 15. Upload workflow artifacts ─────────────────────────────────────
+      - name: Fix artifact directory permissions
+        # Belt-and-suspenders: any sudo-created files (clamscan log, docker cp,
+        # etc.) are re-owned to the runner user so upload-artifact can read them.
+        if: always()
+        run: sudo chown -R "$(id -u):$(id -g)" artifacts/ 2>/dev/null || true
+
       - name: Upload artifacts to GitHub
         uses: actions/upload-artifact@v4
         with:
