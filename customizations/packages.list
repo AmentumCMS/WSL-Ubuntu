@@ -1,0 +1,71 @@
+# =============================================================================
+# packages.list — Additional packages to install in the WSL image
+#
+# Format:
+#   - One package name per line
+#   - Lines beginning with # are comments
+#   - Blank lines are ignored
+#   - Use the exact apt package name (e.g. `apt-cache search <term>`)
+#
+# These packages are installed BEFORE STIG hardening so that hardening rules
+# (e.g., setting file permissions on config files) apply to them.
+# Add org-specific packages in the sections below.
+# =============================================================================
+
+# ── Core utilities ────────────────────────────────────────────────────────────
+bash-completion
+man-db
+less
+vim
+nano
+wget
+curl
+unzip
+zip
+jq
+tree
+htop
+tmux
+screen
+
+# ── Networking ────────────────────────────────────────────────────────────────
+iputils-ping
+net-tools
+dnsutils
+nmap
+traceroute
+netcat-openbsd
+iproute2
+openssh-client
+
+# ── Security utilities ────────────────────────────────────────────────────────
+openssl
+gnupg2
+gpg-agent
+fail2ban
+ufw
+aide
+rkhunter
+chkrootkit
+
+# ── Development tools (remove if not needed) ─────────────────────────────────
+# git
+# build-essential
+# python3
+# python3-pip
+# python3-venv
+# nodejs
+# npm
+
+# ── Monitoring & observability ────────────────────────────────────────────────
+sysstat
+lsof
+strace
+ltrace
+
+# ── Organization-specific packages ───────────────────────────────────────────
+# Add your organization's required packages below:
+#
+# Example:
+#   myorg-ca-certificates
+#   myorg-proxy-config

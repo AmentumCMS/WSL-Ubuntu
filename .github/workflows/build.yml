@@ -1,0 +1,384 @@
+name: Build WSL Ubuntu Image
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Builds a hardened, STIG-compliant Ubuntu WSL2 rootfs tarball and Docker image.
+# Artifacts produced each run:
+#   • wsl-ubuntu-<version>-<build>.tar.gz  — WSL-importable rootfs
+#   • SHA256SUMS / SHA512SUMS              — integrity checksums
+#   • scap-results/                         — OpenSCAP pre/post HTML + XML
+#   • scan-results/clamav-results.txt       — ClamAV antivirus report
+#   • scan-results/trivy-results.*          — Trivy CVE report (table + SARIF)
+#   • scan-results/grype-results.*          — Grype CVE report (table + SARIF)
+#   • scan-results/*-sbom.spdx.json        — Software Bill of Materials (SPDX)
+#   • scan-results/*-sbom.cyclonedx.json   — Software Bill of Materials (CycloneDX)
+#
+# Required secrets (set in repo Settings → Secrets):
+#   GITHUB_TOKEN      — automatically provided by Actions (GHCR push + releases)
+#   UBUNTU_PRO_TOKEN  — (optional) Ubuntu Pro attach token for ESM / FIPS
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "0 2 * * 1" # Every Monday at 02:00 UTC
+  workflow_dispatch:
+    inputs:
+      ubuntu_version:
+        description: "Ubuntu version to build"
+        default: "22.04"
+        required: false
+        type: choice
+        options:
+          - "22.04"
+          - "24.04"
+      stig_profile:
+        description: "SCAP/STIG profile ID (leave blank for default STIG)"
+        default: "xccdf_org.ssgproject.content_profile_stig"
+        required: false
+        type: string
+      enable_ubuntu_pro:
+        description: "Attach Ubuntu Pro (requires UBUNTU_PRO_TOKEN secret)"
+        default: "false"
+        required: false
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/wsl-ubuntu
+  # Resolve inputs with fallback defaults for non-dispatch triggers
+  UBUNTU_VERSION: ${{ inputs.ubuntu_version || '22.04' }}
+  STIG_PROFILE: ${{ inputs.stig_profile || 'xccdf_org.ssgproject.content_profile_stig' }}
+  # Pinned tool versions — update here to bump across the entire workflow
+  SYFT_VERSION: "1.18.1"
+  GRYPE_VERSION: "0.87.0"
+
+jobs:
+  build:
+    name: Build · Harden · Scan · Publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write       # Create releases and upload assets
+      packages: write       # Push to GHCR
+      security-events: write # Upload SARIF to GitHub Security tab
+      id-token: write        # OIDC for attestations
+      attestations: write    # Publish build provenance
+
+    steps:
+      # ── 1. Source ─────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Version metadata ───────────────────────────────────────────────
+      - name: Compute version and artifact names
+        id: meta
+        run: |
+          set -euo pipefail
+          SHORT_SHA="${GITHUB_SHA::8}"
+          DATE="$(date -u +%Y%m%d)"
+
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF_NAME}"
+          else
+            VERSION="${DATE}-${SHORT_SHA}"
+          fi
+
+          ARTIFACT_BASE="wsl-ubuntu-${UBUNTU_VERSION}-${VERSION}"
+          {
+            echo "version=${VERSION}"
+            echo "artifact_base=${ARTIFACT_BASE}"
+            echo "image_tag=${REGISTRY}/${IMAGE_NAME}:${VERSION}"
+            echo "image_latest=${REGISTRY}/${IMAGE_NAME}:latest"
+          } >> "$GITHUB_OUTPUT"
+
+      # ── 3. Container registry login ───────────────────────────────────────
+      - name: Log in to GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── 4. Install host-side tooling ──────────────────────────────────────
+      - name: Install host build tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            ca-certificates \
+            curl \
+            wget \
+            clamav \
+            clamav-freshclam
+
+          # Syft — SBOM generation (pinned version)
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
+            | sudo sh -s -- -b /usr/local/bin "v${SYFT_VERSION}"
+
+          # Grype — vulnerability scanner (pinned version)
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh \
+            | sudo sh -s -- -b /usr/local/bin "v${GRYPE_VERSION}"
+
+          # Trivy — vulnerability scanner via official apt repo
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key \
+            | gpg --dearmor \
+            | sudo tee /usr/share/keyrings/trivy.gpg > /dev/null
+          echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] \
+            https://aquasecurity.github.io/trivy-repo/deb generic main" \
+            | sudo tee /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update -q
+          sudo apt-get install -y trivy
+
+      # ── 5. Build WSL rootfs ───────────────────────────────────────────────
+      - name: Build WSL rootfs
+        id: build
+        env:
+          ARTIFACT_BASE: ${{ steps.meta.outputs.artifact_base }}
+          ENABLE_UBUNTU_PRO: ${{ inputs.enable_ubuntu_pro || 'false' }}
+          UBUNTU_PRO_TOKEN: ${{ secrets.UBUNTU_PRO_TOKEN || '' }}
+        run: |
+          chmod +x scripts/*.sh
+          bash scripts/build-wsl-image.sh
+
+      # ── 6. Extract rootfs for host-side scanning ──────────────────────────
+      - name: Extract rootfs for scanning
+        run: |
+          sudo mkdir -p /tmp/rootfs-scan
+          sudo tar -xzf "artifacts/${{ steps.meta.outputs.artifact_base }}.tar.gz" \
+            -C /tmp/rootfs-scan \
+            --numeric-owner \
+            2>/dev/null || true
+          sudo chmod -R a+rX /tmp/rootfs-scan 2>/dev/null || true
+          echo "Rootfs extracted to /tmp/rootfs-scan"
+
+      # ── 7. ClamAV antivirus scan ──────────────────────────────────────────
+      - name: Update ClamAV virus definitions
+        run: |
+          sudo systemctl stop clamav-freshclam 2>/dev/null || true
+          sudo freshclam --quiet 2>&1 \
+            || echo "WARNING: freshclam update had issues; continuing with existing definitions"
+
+      - name: ClamAV antivirus scan
+        run: |
+          mkdir -p artifacts/scan-results
+          CLAM_EXIT=0
+          sudo clamscan \
+            --recursive \
+            --infected \
+            --suppress-ok-results \
+            --official-db-only=no \
+            --log="artifacts/scan-results/clamav-results.txt" \
+            /tmp/rootfs-scan || CLAM_EXIT=$?
+
+          echo "ClamAV exit code: ${CLAM_EXIT}"
+          # Exit 1 = virus found; Exit 2 = scan error (treat as warning)
+          if [ "${CLAM_EXIT}" -eq 1 ]; then
+            echo "::error::ClamAV detected malware in the WSL image!"
+            exit 1
+          fi
+
+      # ── 8. SBOM generation ────────────────────────────────────────────────
+      - name: Generate SBOM (SPDX + CycloneDX)
+        run: |
+          SBOM_BASE="artifacts/scan-results/${{ steps.meta.outputs.artifact_base }}-sbom"
+
+          # SPDX JSON (widely supported by tooling)
+          syft dir:/tmp/rootfs-scan \
+            --output spdx-json \
+            --file "${SBOM_BASE}.spdx.json"
+
+          # CycloneDX JSON (NIST SBOM standard)
+          syft dir:/tmp/rootfs-scan \
+            --output cyclonedx-json \
+            --file "${SBOM_BASE}.cyclonedx.json"
+
+          echo "SBOM files generated:"
+          ls -lh "${SBOM_BASE}"*
+
+      # ── 9. Grype CVE scan ────────────────────────────────────────────────
+      - name: Grype vulnerability scan
+        run: |
+          SBOM="artifacts/scan-results/${{ steps.meta.outputs.artifact_base }}-sbom.spdx.json"
+          RESULTS_DIR="artifacts/scan-results"
+
+          # SARIF output for GitHub Security tab
+          grype "sbom:${SBOM}" \
+            --output sarif \
+            --file "${RESULTS_DIR}/grype-results.sarif" || true
+
+          # Human-readable table output
+          grype "sbom:${SBOM}" \
+            --output table \
+            --file "${RESULTS_DIR}/grype-results.txt" || true
+
+          echo "Grype scan complete"
+
+      # ── 10. Trivy CVE scan ────────────────────────────────────────────────
+      - name: Trivy vulnerability scan (SARIF)
+        run: |
+          trivy rootfs \
+            --format sarif \
+            --output artifacts/scan-results/trivy-results.sarif \
+            --severity CRITICAL,HIGH,MEDIUM,LOW \
+            --exit-code 0 \
+            /tmp/rootfs-scan || true
+
+      - name: Trivy vulnerability scan (table)
+        run: |
+          trivy rootfs \
+            --format table \
+            --output artifacts/scan-results/trivy-results.txt \
+            --severity CRITICAL,HIGH,MEDIUM,LOW \
+            --exit-code 0 \
+            /tmp/rootfs-scan || true
+
+      # ── 11. Upload SARIF to GitHub Security tab ───────────────────────────
+      - name: Upload Trivy SARIF to GitHub Security
+        if: github.event_name != 'pull_request'
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: artifacts/scan-results/trivy-results.sarif
+          category: trivy-wsl-image
+
+      - name: Upload Grype SARIF to GitHub Security
+        if: github.event_name != 'pull_request'
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: artifacts/scan-results/grype-results.sarif
+          category: grype-wsl-image
+
+      # ── 12. Checksums ─────────────────────────────────────────────────────
+      - name: Generate checksums
+        run: |
+          cd artifacts
+          # Verify at least one tarball was produced before checksumming
+          if ! ls ./*.tar.gz 1>/dev/null 2>&1; then
+            echo "::error::No .tar.gz artifacts found in artifacts/ — build may have failed"
+            exit 1
+          fi
+          sha256sum ./*.tar.gz > SHA256SUMS
+          sha512sum ./*.tar.gz > SHA512SUMS
+          echo "--- SHA256SUMS ---"
+          cat SHA256SUMS
+
+      # ── 13. Publish Docker image to GHCR ─────────────────────────────────
+      - name: Push Docker image to GHCR
+        id: push
+        if: github.event_name != 'pull_request'
+        run: |
+          IMAGE_TAG="${{ steps.meta.outputs.image_tag }}"
+          IMAGE_LATEST="${{ steps.meta.outputs.image_latest }}"
+
+          docker tag wsl-ubuntu:local "${IMAGE_TAG}"
+          docker push "${IMAGE_TAG}"
+          echo "Pushed ${IMAGE_TAG}"
+
+          if [[ "${GITHUB_REF}" == refs/heads/main ]] || [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            docker tag wsl-ubuntu:local "${IMAGE_LATEST}"
+            docker push "${IMAGE_LATEST}"
+            echo "Pushed ${IMAGE_LATEST}"
+          fi
+
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "${IMAGE_TAG}" \
+            2>/dev/null | cut -d@ -f2 || echo "")
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "Image digest: ${DIGEST}"
+
+      # ── 14. Build provenance attestation ─────────────────────────────────
+      - name: Generate build attestation
+        if: github.event_name != 'pull_request' && steps.push.outputs.digest != ''
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+      # ── 15. Upload workflow artifacts ─────────────────────────────────────
+      - name: Upload artifacts to GitHub
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.meta.outputs.artifact_base }}
+          path: artifacts/
+          retention-days: 90
+          compression-level: 0 # Already compressed
+
+      # ── 16. GitHub Release ────────────────────────────────────────────────
+      - name: Create GitHub Release
+        if: >
+          github.event_name != 'pull_request' &&
+          (startsWith(github.ref, 'refs/tags/') || github.ref == 'refs/heads/main')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: >-
+            ${{ startsWith(github.ref, 'refs/tags/')
+              && github.ref_name
+              || format('build-{0}', steps.meta.outputs.version) }}
+          name: >-
+            ${{ startsWith(github.ref, 'refs/tags/')
+              && format('Release {0}', github.ref_name)
+              || format('Automated Build {0}', steps.meta.outputs.version) }}
+          prerelease: ${{ !startsWith(github.ref, 'refs/tags/') }}
+          generate_release_notes: true
+          fail_on_unmatched_files: false
+          body: |
+            ## WSL Ubuntu ${{ env.UBUNTU_VERSION }} — Build `${{ steps.meta.outputs.version }}`
+
+            ### Import into WSL2 (PowerShell)
+
+            ```powershell
+            # Download tarball and checksums from the assets list above, then:
+            # Verify (replace <sha256> with value from SHA256SUMS)
+            (Get-FileHash "${{ steps.meta.outputs.artifact_base }}.tar.gz" -Algorithm SHA256).Hash
+
+            # Import
+            wsl --import Ubuntu-Hardened C:\WSL\Ubuntu-Hardened "${{ steps.meta.outputs.artifact_base }}.tar.gz" --version 2
+            wsl -d Ubuntu-Hardened
+            ```
+
+            ### Pull from GHCR (Docker / Linux)
+
+            ```bash
+            docker pull ${{ steps.meta.outputs.image_tag }}
+            ```
+
+            ### Artifacts Included
+
+            | File | Description |
+            |------|-------------|
+            | `*.tar.gz` | WSL2-importable Ubuntu rootfs |
+            | `SHA256SUMS` / `SHA512SUMS` | Integrity checksums |
+            | `post-remediation-report.html` | OpenSCAP/STIG compliance report |
+            | `clamav-results.txt` | ClamAV antivirus scan |
+            | `trivy-results.txt` | Trivy CVE scan |
+            | `grype-results.txt` | Grype CVE scan |
+            | `*-sbom.spdx.json` | SBOM (SPDX format) |
+            | `*-sbom.cyclonedx.json` | SBOM (CycloneDX format) |
+
+            ### Security & Compliance
+            - 🛡️ STIG/SCAP hardening via OpenSCAP (`${{ env.STIG_PROFILE }}`)
+            - 🦠 ClamAV antivirus scan completed
+            - 🔍 Trivy + Grype CVE scans completed (SARIF in GitHub Security tab)
+            - 📋 SBOM in SPDX and CycloneDX formats
+            - 🔏 Build provenance attestation attached to GHCR image
+          files: |
+            artifacts/*.tar.gz
+            artifacts/SHA256SUMS
+            artifacts/SHA512SUMS
+            artifacts/scap-results/*.html
+            artifacts/scap-results/*.xml
+            artifacts/scan-results/clamav-results.txt
+            artifacts/scan-results/trivy-results.txt
+            artifacts/scan-results/grype-results.txt
+            artifacts/scan-results/*.spdx.json
+            artifacts/scan-results/*.cyclonedx.json
